@@ -92,6 +92,11 @@ class WanTrainingModule(DiffusionTrainingModule):
 if __name__ == "__main__":
     parser = wan_parser()
     args = parser.parse_args()
+
+    img_op = UnifiedDataset.default_image_operator(base_path=args.dataset_base_path,
+                                                   height=args.height,
+                                                   width=args.width)
+
     dataset = UnifiedDataset(
         base_path=args.dataset_base_path,
         metadata_path=args.dataset_metadata_path,
@@ -108,6 +113,7 @@ if __name__ == "__main__":
             time_division_factor=4,
             time_division_remainder=1,
         ),
+        special_operator_map={"ref_mask": img_op}
     )
     model = WanTrainingModule(
         model_paths=args.model_paths,

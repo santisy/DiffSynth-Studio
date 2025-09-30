@@ -56,6 +56,7 @@ class WanVideoPipeline(BasePipeline):
             WanVideoUnit_ImageEmbedderVAE(),
             WanVideoUnit_ImageEmbedderCLIP(),
             WanVideoUnit_ImageEmbedderFused(),
+            WanVideoUnit_RefMaskFirstFrame(),
             WanVideoUnit_FunControl(),
             WanVideoUnit_FunReference(),
             WanVideoUnit_FunCameraControl(),
@@ -367,9 +368,11 @@ class WanVideoPipeline(BasePipeline):
             pipe.width_division_factor = pipe.vae.upsampling_factor * 2
 
         # Initialize tokenizer
-        tokenizer_config.download_if_necessary(use_usp=use_usp)
+        #tokenizer_config.download_if_necessary(use_usp=use_usp)
         pipe.prompter.fetch_models(pipe.text_encoder)
-        pipe.prompter.fetch_tokenizer(tokenizer_config.path)
+        #print(tokenizer_config.path)
+        #pipe.prompter.fetch_tokenizer(tokenizer_config.path)
+        pipe.prompter.fetch_tokenizer('./models/Wan-AI/Wan2.1-T2V-1.3B/google/umt5-xxl')
 
         if audio_processor_config is not None:
             audio_processor_config.download_if_necessary(use_usp=use_usp)
@@ -388,6 +391,8 @@ class WanVideoPipeline(BasePipeline):
         negative_prompt: Optional[str] = "",
         # Image-to-video
         input_image: Optional[Image.Image] = None,
+        # Mask-indication
+        ref_mask: Optional[Image.Image] = None,
         # First-last-frame-to-video
         end_image: Optional[Image.Image] = None,
         # Video-to-video
@@ -456,6 +461,7 @@ class WanVideoPipeline(BasePipeline):
         }
         inputs_shared = {
             "input_image": input_image,
+            "ref_mask": ref_mask,
             "end_image": end_image,
             "input_video": input_video, "denoising_strength": denoising_strength,
             "control_video": control_video, "reference_image": reference_image,
@@ -679,6 +685,56 @@ class WanVideoUnit_ImageEmbedderVAE(PipelineUnit):
         y = y.to(dtype=pipe.torch_dtype, device=pipe.device)
         return {"y": y}
 
+import torch
+import torch.nn.functional as F
+import numpy as np
+from PIL import Image
+
+class WanVideoUnit_RefMaskFirstFrame(PipelineUnit):
+    """
+    Apply a spatial ref_mask ONLY to the 4 mask channels at t=0.
+    ref_mask: 1 = moving/articulating region (reduce 'given' strength), 0 = preserve.
+    Latents (16 channels) are left UNCHANGED.
+    y shape: [B, 20, T, H8, W8]
+    """
+    def __init__(self):
+        super().__init__(input_params=("y", "height", "width", "ref_mask"),
+                         onload_model_names=())
+
+    @staticmethod
+    def _to_bin_mask(ref_mask, device, dtype):
+        if isinstance(ref_mask, Image.Image):
+            a = np.array(ref_mask.convert("L"))
+            t = torch.from_numpy((a > 127).astype("float32")).unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
+        elif isinstance(ref_mask, torch.Tensor):
+            t = ref_mask
+            if t.dim() == 2:   t = t.unsqueeze(0).unsqueeze(0)      # [1,1,H,W]
+            elif t.dim() == 3: t = t.unsqueeze(0)                   # [1,1,H,W] if [1,H,W]
+            elif t.dim() == 4: pass                                 # [B,1,H,W]
+            else: raise ValueError(f"Bad ref_mask shape {tuple(t.shape)}")
+            if t.shape[1] != 1: t = (t.sum(1, keepdim=True) > 0).float()
+        else:
+            raise TypeError(f"ref_mask must be PIL.Image or torch.Tensor, the ref_mask is type of {type(ref_mask)}")
+        return t.to(device=device, dtype=dtype).clamp(0, 1)
+
+    def process(self, pipe: "WanVideoPipeline", y, height, width, ref_mask=None):
+        if y is None or ref_mask is None:
+            return {"y": y}
+        assert y.dim() == 5 and y.shape[1] == 20, f"y must be [B,20,T,H8,W8], got {tuple(y.shape)}"
+
+        B, _, T, H8, W8 = y.shape
+        m = self._to_bin_mask(ref_mask, y.device, y.dtype)          # [*,1,H,W]
+        if m.shape[0] == 1 and B > 1: m = m.expand(B, -1, -1, -1)   # [B,1,H,W]
+
+        # downsample to latent grid with nearest (keeps binary)
+        m_lat = F.interpolate(m, size=(height//8, width//8), mode="nearest")  # [B,1,H8,W8]
+        preserve = (1.0 - m_lat).clamp(0, 1)                        # 1=preserve, 0=release
+        preserve = preserve.unsqueeze(2)                             # [B,1,1,H8,W8] for time broadcast
+
+        # ONLY scale the 4 mask channels at t=0; leave 16 latent channels intact
+        y[:, :4, 0:1, :, :] = y[:, :4, 0:1, :, :] * preserve
+
+        return {"y": y}
 
 
 class WanVideoUnit_ImageEmbedderFused(PipelineUnit):

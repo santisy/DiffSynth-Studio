@@ -136,11 +136,24 @@ class VideoData:
             frame = self.__getitem__(i)
             frame.save(os.path.join(folder, f"{i}.png"))
 
+import cv2
 
-def save_video(frames, save_path, fps, quality=9, ffmpeg_params=None):
+def save_video(frames, save_path, fps, quality=9, ffmpeg_params=None, resize=None):
     writer = imageio.get_writer(save_path, fps=fps, quality=quality, ffmpeg_params=ffmpeg_params)
     for frame in tqdm(frames, desc="Saving video"):
         frame = np.array(frame)
+        
+        # Resize frame if resize parameter is provided
+        if resize is not None:
+            if isinstance(resize, (list, tuple)) and len(resize) == 2:
+                # Resize to specific (width, height)
+                frame = cv2.resize(frame, resize, interpolation=cv2.INTER_LINEAR)
+            elif isinstance(resize, (int, float)):
+                # Resize by scale factor
+                new_width = int(frame.shape[1] * resize)
+                new_height = int(frame.shape[0] * resize)
+                frame = cv2.resize(frame, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
+        
         writer.append_data(frame)
     writer.close()
 
