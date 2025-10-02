@@ -11,6 +11,7 @@ from diffsynth.pipelines.wan_video_new import WanVideoPipeline, ModelConfig
 parser = argparse.ArgumentParser()
 parser.add_argument("--lora_folder", type=str, default=None)
 parser.add_argument("--img_path", type=str, required=True)
+parser.add_argument("--mask_path", type=str, required=True)
 parser.add_argument("--prompt", type=str, required=True)
 parser.add_argument("--output_path", type=str, required=True)
 parser.add_argument("--size", type=lambda y: [int(x) for x in y.split(',')], default=None)
@@ -67,8 +68,10 @@ step_n_list.append('original_ckpt')
 MODEL_ROOT = "/mnt/shared-storage-user/yangdingdong/models/Wan2.1-I2V-14B-480P"
 
 image = Image.open(args.img_path).convert("RGB")
+mask = Image.open(args.mask_path)
 if args.size is not None:
     image = image.resize((args.size[0], args.size[1]), resample=Image.Resampling.BILINEAR)
+    mask = image.resize((args.size[0], args.size[1]), resample=Image.Resampling.BILINEAR)
     width = args.size[0]
     height = args.size[1]
     resize = None
@@ -112,6 +115,7 @@ for i, (lora_ckpt, step_n) in enumerate(zip(lora_ckpts, step_n_list)):
         prompt=args.prompt,
         negative_prompt="色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走",
         input_image=image,
+        ref_mask=mask,
         seed=0,
         tiled=False,
         height=height,

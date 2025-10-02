@@ -729,7 +729,7 @@ class WanVideoUnit_RefMaskFirstFrame(PipelineUnit):
         # downsample to latent grid with nearest (keeps binary)
         m_lat = F.interpolate(m, size=(height//8, width//8), mode="nearest")  # [B,1,H8,W8]
         preserve = (1.0 - m_lat).clamp(0, 1)                        # 1=preserve, 0=release
-        preserve = preserve.unsqueeze(2)                             # [B,1,1,H8,W8] for time broadcast
+        preserve = preserve.unsqueeze(2)                            # [B,1,1,H8,W8] for time broadcast
 
         # ONLY scale the 4 mask channels at t=0; leave 16 latent channels intact
         y[:, :4, 0:1, :, :] = y[:, :4, 0:1, :, :] * preserve
