@@ -25,12 +25,11 @@ def merge_csv_files(csv_files, output_path):
 
 def copy_other_files(input_folders, output_folder):
     for folder in input_folders:
-        folder_name = os.path.basename(folder)
         for item in os.listdir(folder):
             if item.lower().endswith('.csv'):
                 continue
             item_path = os.path.join(folder, item)
-            dest_path = os.path.join(output_folder, f"{folder_name}_{item}")
+            dest_path = os.path.join(output_folder, item)
             if os.path.isfile(item_path):
                 shutil.copy2(item_path, dest_path)
             elif os.path.isdir(item_path):

@@ -70,11 +70,11 @@ MODEL_ROOT = "/mnt/shared-storage-user/yangdingdong/models/Wan2.1-I2V-14B-480P"
 image = Image.open(args.img_path).convert("RGB")
 mask = Image.open(args.mask_path)
 if args.size is not None:
+    resize = image.size
     image = image.resize((args.size[0], args.size[1]), resample=Image.Resampling.BILINEAR)
-    mask = image.resize((args.size[0], args.size[1]), resample=Image.Resampling.BILINEAR)
+    mask = mask.resize((args.size[0], args.size[1]), resample=Image.Resampling.BILINEAR)
     width = args.size[0]
     height = args.size[1]
-    resize = None
 else:
     width = 832
     height = 480
