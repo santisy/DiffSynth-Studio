@@ -56,14 +56,27 @@ if lora_folder is not None:
         if i % stride == 0:
             filtered_pairs.append((step_num, ckpt, basename))
     
-    # Extract the filtered checkpoints and step names
-    lora_ckpts = [pair[1] for pair in filtered_pairs]
-    step_n_list = [pair[2] for pair in filtered_pairs]
+    # Skip checkpoints whose outputs already exist
+    for _, ckpt, basename in filtered_pairs:
+        out_file = os.path.join(args.output_path, f"{basename}.mp4")
+        if os.path.exists(out_file):
+            print(f"Skipping checkpoint '{basename}' because '{out_file}' already exists.")
+            continue
+        lora_ckpts.append(ckpt)
+        step_n_list.append(basename)
 
 
-# Always include the original checkpoint (no LoRA)
-lora_ckpts.append(None)
-step_n_list.append('original_ckpt')
+# Always include the original checkpoint (no LoRA) if not already rendered
+original_out = os.path.join(args.output_path, "original_ckpt.mp4")
+if not os.path.exists(original_out):
+    lora_ckpts.append(None)
+    step_n_list.append('original_ckpt')
+else:
+    print(f"Skipping original checkpoint because '{original_out}' already exists.")
+
+if not lora_ckpts:
+    print("No checkpoints to process; all outputs already exist.")
+    raise SystemExit(0)
 
 MODEL_ROOT = "/mnt/shared-storage-user/yangdingdong/models/Wan2.1-I2V-14B-480P"
 
