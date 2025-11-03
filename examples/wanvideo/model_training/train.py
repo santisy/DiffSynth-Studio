@@ -1,4 +1,5 @@
-import torch, os, json
+import torch, os, json, re
+from pathlib import Path
 from diffsynth import load_state_dict
 from diffsynth.pipelines.wan_video_new import WanVideoPipeline, ModelConfig
 from diffsynth.trainers.utils import DiffusionTrainingModule, ModelLogger, launch_training_task, wan_parser
@@ -89,9 +90,33 @@ class WanTrainingModule(DiffusionTrainingModule):
         return loss
 
 
+def resolve_lora_checkpoint_path(lora_checkpoint):
+    if lora_checkpoint is None:
+        return None
+    ckpt_path = Path(lora_checkpoint).expanduser()
+    if ckpt_path.is_dir():
+        candidates = sorted(ckpt_path.glob("*.safetensors"), key=lambda path: path.stat().st_mtime)
+        if not candidates:
+            raise FileNotFoundError(f"No LoRA checkpoints found in directory: {ckpt_path}")
+        ckpt_path = candidates[-1]
+    if not ckpt_path.is_file():
+        raise FileNotFoundError(f"LoRA checkpoint not found: {ckpt_path}")
+    return str(ckpt_path)
+
+
+def infer_initial_step_from_checkpoint(lora_checkpoint):
+    match = re.search(r"step[-_]?(\d+)", Path(lora_checkpoint).stem)
+    return int(match.group(1)) if match else 0
+
+
 if __name__ == "__main__":
     parser = wan_parser()
     args = parser.parse_args()
+    initial_step = 0
+    args.lora_checkpoint = resolve_lora_checkpoint_path(args.lora_checkpoint)
+    if args.lora_checkpoint is not None:
+        print(f"Using LoRA checkpoint: {args.lora_checkpoint}")
+        initial_step = infer_initial_step_from_checkpoint(args.lora_checkpoint)
 
     img_op = UnifiedDataset.default_image_operator(base_path=args.dataset_base_path,
                                                    height=args.height,
@@ -130,6 +155,7 @@ if __name__ == "__main__":
     )
     model_logger = ModelLogger(
         args.output_path,
-        remove_prefix_in_ckpt=args.remove_prefix_in_ckpt
+        remove_prefix_in_ckpt=args.remove_prefix_in_ckpt,
+        initial_step=initial_step
     )
     launch_training_task(dataset, model, model_logger, args=args)

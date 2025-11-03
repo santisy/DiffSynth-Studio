@@ -1,4 +1,4 @@
-JOB_NAME=lora-finetune-0930-512-512-dc
+JOB_NAME=lora-finetune-1007-filtered-02
 rjob delete $JOB_NAME
 rjob submit \
 	--name=$JOB_NAME \

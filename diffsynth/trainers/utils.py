@@ -478,11 +478,11 @@ class DiffusionTrainingModule(torch.nn.Module):
 
 
 class ModelLogger:
-    def __init__(self, output_path, remove_prefix_in_ckpt=None, state_dict_converter=lambda x:x):
+    def __init__(self, output_path, remove_prefix_in_ckpt=None, state_dict_converter=lambda x:x, initial_step=0):
         self.output_path = output_path
         self.remove_prefix_in_ckpt = remove_prefix_in_ckpt
         self.state_dict_converter = state_dict_converter
-        self.num_steps = 0
+        self.num_steps = initial_step
 
 
     def on_step_end(self, accelerator, model, save_steps=None):
