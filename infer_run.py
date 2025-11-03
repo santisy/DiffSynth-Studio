@@ -1,8 +1,9 @@
 import os
-import glob
 import argparse
 import subprocess
 import sys
+import json
+import shlex
 from pathlib import Path
 from collections import deque
 import re
@@ -13,61 +14,52 @@ def extract_image_name(img_path):
     return Path(img_path).stem
 
 
-def find_masks(mask_root, image_name, mask_id_range=None):
+def parse_mask_filename(mask_filename, image_name, fallback_hash=None):
     """
-    Find all masks matching the pattern: {image_name}-{hash}-mask-{id:03d}.png
-    Returns list of tuples: (mask_path, hash, mask_id)
-    mask_id_range is a tuple(start, end) inclusive where bounds can be None.
+    Parse mask filename to extract hash part and mask id.
+    Returns (hash_part, mask_id).
     """
-    pattern = os.path.join(mask_root, f"{image_name}-*-mask-*.png")
-    masks = glob.glob(pattern)
-
-    mask_info = []
-    mask_regex = re.compile(
-        rf"^{re.escape(image_name)}-(?P<hash>[A-Za-z0-9]+)-mask-(?P<mask_id>\d+)\.png$"
+    mask_pattern = "^{}-(?P<hash>[A-Za-z0-9]+)-mask-(?P<mask_id>\\d+)\\.png$".format(
+        re.escape(image_name)
     )
-    for mask_path in masks:
-        mask_filename = Path(mask_path).name
-        match = mask_regex.match(mask_filename)
-        if not match:
-            continue
+    mask_regex = re.compile(mask_pattern)
+    filename = Path(mask_filename).name
+    match = mask_regex.match(filename)
+    if match:
+        return match.group("hash"), int(match.group("mask_id"))
 
-        hash_part = match.group("hash")
-        mask_id = int(match.group("mask_id"))
+    mask_id_match = re.search(r"mask-(\d+)", filename)
+    if fallback_hash is not None and mask_id_match:
+        return fallback_hash, int(mask_id_match.group(1))
 
-        if mask_id_range:
-            start, end = mask_id_range
-            if start is not None and mask_id < start:
-                continue
-            if end is not None and mask_id > end:
-                continue
-
-        mask_info.append((mask_path, hash_part, mask_id))
-
-    mask_info.sort(key=lambda item: item[2])
-
-    return mask_info
+    raise ValueError(
+        f"Mask filename '{filename}' does not follow expected pattern and no fallback hash provided."
+    )
 
 
-def generate_command(img_path, lora_folder, prompt, output_root, mask_path, 
+def generate_command(img_path, lora_folder, prompt, output_root, mask_path,
                      hash_part, mask_id, stride, size="512,512"):
     """Generate inference command for a single mask."""
     image_name = extract_image_name(img_path)
     output_path = os.path.join(
         output_root, f"{image_name}-{hash_part}-results_mask_{mask_id:03d}"
     )
-    
-    cmd = [
-        "python", "wan_14B_480P_infer.py",
-        "--img_path", img_path,
-        "--lora_folder", lora_folder,
+
+    cmd = ["python", "wan_14B_480P_infer.py"]
+    cmd.extend(["--img_path", img_path])
+    if lora_folder:
+        cmd.extend(["--lora_folder", lora_folder])
+    cmd.extend([
         "--prompt", prompt,
         "--output_path", output_path,
-        "--size", size,
+    ])
+    if size:
+        cmd.extend(["--size", size])
+    cmd.extend([
         "--mask_path", mask_path,
-        "--stride", str(stride)
-    ]
-    
+        "--stride", str(stride),
+    ])
+
     return cmd
 
 
@@ -130,15 +122,15 @@ def run_command_with_live_output(cmd, command_num, total_commands):
     If an error occurs, display the full output for debugging.
     """
     print(f"Executing command {command_num}/{total_commands}...")
-    
+
     # Buffer to store all output (for error case)
     full_output = []
-    
+
     # Use deque to maintain last 4 lines (for normal case)
     last_lines = deque(maxlen=4)
     current_line_buffer = ""
     lines_displayed = 0
-    
+
     process = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -147,11 +139,11 @@ def run_command_with_live_output(cmd, command_num, total_commands):
         bufsize=1,
         universal_newlines=True
     )
-    
+
     for line in process.stdout:
         # Store all output for potential error display
         full_output.append(line.rstrip('\n'))
-        
+
         # Check if this is a progress bar update (contains \r)
         if '\r' in line:
             # Split by \r and take the last part (most recent update)
@@ -160,17 +152,17 @@ def run_command_with_live_output(cmd, command_num, total_commands):
                 if part.strip():
                     current_line_buffer = part
             current_line_buffer = parts[-1].rstrip('\n')
-            
+
             # Clear previous display
             if lines_displayed > 0:
                 clear_lines(lines_displayed)
-            
+
             # Update the last line in deque if it exists, otherwise add
             if last_lines and not last_lines[-1].endswith('\n'):
                 last_lines[-1] = current_line_buffer
             else:
                 last_lines.append(current_line_buffer)
-            
+
             # Display the last 4 lines
             lines_displayed = 0
             for display_line in last_lines:
@@ -184,26 +176,26 @@ def run_command_with_live_output(cmd, command_num, total_commands):
                 # Clear previous display
                 if lines_displayed > 0:
                     clear_lines(lines_displayed)
-                
+
                 # Add new line
                 last_lines.append(line)
-                
+
                 # Display the last 4 lines
                 lines_displayed = 0
                 for display_line in last_lines:
                     print(display_line)
                     lines_displayed += 1
                 sys.stdout.flush()
-    
+
     process.wait()
     returncode = process.returncode
-    
+
     # If there was an error, clear the 4-line display and show full output
     if returncode != 0:
         # Clear the current display
         if lines_displayed > 0:
             clear_lines(lines_displayed)
-        
+
         print("\n" + "="*80)
         print("ERROR OCCURRED - Full output below:")
         print("="*80)
@@ -216,97 +208,224 @@ def run_command_with_live_output(cmd, command_num, total_commands):
         # Ensure we end with a newline for successful runs
         if lines_displayed > 0:
             print()
-    
+
     return returncode
 
 
+def collect_dataset_tasks(data_root, annotations_root, mask_id_range=None):
+    """
+    Collect all inference tasks from dataset root.
+    Returns a tuple (tasks, warnings).
+    Each task is a dict with keys:
+        image_name, image_path, mask_path, mask_id, hash_part, prompt
+    """
+    data_root = Path(data_root)
+    annotations_root = Path(annotations_root)
+
+    tasks = []
+    warnings = []
+
+    json_paths = sorted(annotations_root.glob("*.json"))
+    for json_path in json_paths:
+        try:
+            with open(json_path, "r", encoding="utf-8") as handle:
+                annotation = json.load(handle)
+        except (OSError, json.JSONDecodeError) as exc:
+            warnings.append(f"Failed to read {json_path}: {exc}")
+            continue
+
+        image_filename = annotation.get("image_filename")
+        if not image_filename:
+            warnings.append(f"{json_path} missing 'image_filename'; skipping.")
+            continue
+
+        image_path = data_root / image_filename
+        if not image_path.is_file():
+            warnings.append(f"Image file not found: {image_path}")
+            continue
+
+        masks = annotation.get("masks", [])
+        if not masks:
+            warnings.append(f"No masks listed in {json_path}; skipping.")
+            continue
+
+        image_name = Path(image_filename).stem
+        image_hash = annotation.get("image_hash")
+
+        for mask_entry in masks:
+            mask_filename = mask_entry.get("mask_filename")
+            prompt = mask_entry.get("prompt")
+            if not mask_filename:
+                warnings.append(f"{json_path} contains mask entry without 'mask_filename'.")
+                continue
+            if prompt is None:
+                warnings.append(f"{json_path} mask '{mask_filename}' missing prompt.")
+                continue
+
+            mask_path = annotations_root / mask_filename
+            if not mask_path.is_file():
+                warnings.append(f"Mask file not found: {mask_path}")
+                continue
+
+            try:
+                hash_part, mask_id = parse_mask_filename(mask_filename, image_name, image_hash)
+            except ValueError as exc:
+                warnings.append(str(exc))
+                continue
+
+            if mask_id_range:
+                start, end = mask_id_range
+                if start is not None and mask_id < start:
+                    continue
+                if end is not None and mask_id > end:
+                    continue
+
+            tasks.append({
+                "image_name": image_name,
+                "image_path": str(image_path.resolve()),
+                "mask_path": str(mask_path.resolve()),
+                "mask_id": mask_id,
+                "hash_part": hash_part,
+                "prompt": prompt.strip(),
+            })
+
+    tasks.sort(key=lambda item: (item["image_name"], item["mask_id"]))
+    return tasks, warnings
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Generate and run inference scripts for multiple masks")
-    parser.add_argument("--img_path", type=str, required=True, help="Path to input image")
-    parser.add_argument("--lora_folder", type=str, required=True, help="Path to LoRA model folder")
-    parser.add_argument("--prompt", type=str, required=True, help="Text prompt for generation")
-    parser.add_argument("--output_root", type=str, required=True, help="Root directory for outputs")
-    parser.add_argument("--mask_root", type=str, required=True, help="Root directory containing masks")
-    parser.add_argument("--stride", type=int, default=4, help="Stride parameter")
-    parser.add_argument("--size", type=str, default="512,512", help="Output size (width,height)")
-    parser.add_argument("--dry_run", action="store_true", help="Print commands without executing")
+    parser = argparse.ArgumentParser(
+        description="Run DiffSynth inference across a dataset root."
+    )
+    parser.add_argument(
+        "--data_root",
+        type=str,
+        required=True,
+        help="Root directory containing input images and an annotations subdirectory."
+    )
+    parser.add_argument(
+        "--annotations_subdir",
+        type=str,
+        default="annotations",
+        help="Subdirectory (relative to data_root) containing JSON files and masks."
+    )
+    parser.add_argument(
+        "--lora_folder",
+        type=str,
+        default=None,
+        help="Path to LoRA model folder (optional)."
+    )
+    parser.add_argument(
+        "--output_root",
+        type=str,
+        required=True,
+        help="Root directory for generated outputs."
+    )
+    parser.add_argument("--stride", type=int, default=4, help="Stride parameter.")
+    parser.add_argument(
+        "--size",
+        type=str,
+        default="512,512",
+        help="Output size (width,height). Use blank string to keep original size."
+    )
+    parser.add_argument("--dry_run", action="store_true", help="Print commands without executing.")
     parser.add_argument(
         "--mask_id_range",
         type=parse_mask_id_range,
         help="Limit masks by id using 'start-end', 'start-', '-end', or a single id (inclusive)."
     )
-    
+
     args = parser.parse_args()
-    
-    # Extract image name
-    image_name = extract_image_name(args.img_path)
-    print(f"Processing image: {image_name}")
+
+    data_root = Path(args.data_root).expanduser().resolve()
+
+    annotations_root = Path(args.annotations_subdir)
+    if not annotations_root.is_absolute():
+        annotations_root = data_root / annotations_root
+    annotations_root = annotations_root.expanduser().resolve()
+
+    output_root = Path(args.output_root).expanduser().resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    if not data_root.is_dir():
+        print(f"Data root not found: {data_root}")
+        return
+
+    if not annotations_root.is_dir():
+        print(f"Annotations directory not found: {annotations_root}")
+        return
+
+    lora_folder = Path(args.lora_folder).expanduser().resolve() if args.lora_folder else None
 
     if args.mask_id_range:
         start, end = args.mask_id_range
         start_str = f"{start:03d}" if start is not None else "min"
         end_str = f"{end:03d}" if end is not None else "max"
-        print(f"Mask id filter: {start_str} to {end_str}")
-    
-    # Find all matching masks
-    masks = find_masks(args.mask_root, image_name, args.mask_id_range)
-    
-    if not masks:
-        print(f"No masks found for image '{image_name}' in '{args.mask_root}'")
-        print(f"Looking for pattern: {image_name}-*-mask-*.png")
+        print(f"Mask id filter applied: {start_str} to {end_str}")
+
+    tasks, warnings = collect_dataset_tasks(data_root, annotations_root, args.mask_id_range)
+    for warning in warnings:
+        print(f"[WARN] {warning}")
+
+    if not tasks:
+        print("No inference tasks discovered. Nothing to run.")
         return
-    
-    print(f"Found {len(masks)} mask(s):")
-    for mask_path, hash_part, mask_id in masks:
-        print(f"  - {Path(mask_path).name} (hash: {hash_part}, mask_id: {mask_id:03d})")
-    
+
+    image_names = []
+    last_name = None
+    for task in tasks:
+        if task["image_name"] != last_name:
+            image_names.append(task["image_name"])
+            last_name = task["image_name"]
+
+    print(f"Discovered {len(image_names)} image(s) with {len(tasks)} mask(s) in {annotations_root}.")
+    for image_name in image_names:
+        mask_ids = [task["mask_id"] for task in tasks if task["image_name"] == image_name]
+        mask_ids_str = ", ".join(f"{mask_id:03d}" for mask_id in mask_ids)
+        print(f"  - {image_name}: masks {mask_ids_str}")
+
     print("\nGenerating commands...\n")
-    
-    # Track success/failure
+
+    size_arg = args.size if args.size else None
+    total_commands = len(tasks)
     successful = 0
     failed = 0
-    
-    # Generate and run commands for each mask
-    for i, (mask_path, hash_part, mask_id) in enumerate(masks, 1):
+
+    for idx, task in enumerate(tasks, 1):
         cmd = generate_command(
-            args.img_path,
-            args.lora_folder,
-            args.prompt,
-            args.output_root,
-            mask_path,
-            hash_part,
-            mask_id,
+            task["image_path"],
+            str(lora_folder) if lora_folder else None,
+            task["prompt"],
+            str(output_root),
+            task["mask_path"],
+            task["hash_part"],
+            task["mask_id"],
             args.stride,
-            args.size
+            size_arg
         )
-        
-        # Print command
-        cmd_str = " \\\n    ".join([cmd[0] + " " + cmd[1]] + 
-                                   [f"{cmd[j]} {cmd[j+1]}" for j in range(2, len(cmd), 2)])
-        print(f"Command {i}/{len(masks)}:")
-        print(cmd_str)
+
+        print(f"Command {idx}/{total_commands} for {task['image_name']} mask {task['mask_id']:03d}:")
+        print(shlex.join(cmd))
         print()
-        
-        # Execute command
-        if not args.dry_run:
-            returncode = run_command_with_live_output(cmd, i, len(masks))
-            
-            if returncode == 0:
-                print(f"✓ Successfully completed command {i}/{len(masks)}")
-                successful += 1
-            else:
-                print(f"✗ Failed command {i}/{len(masks)} (exit code: {returncode})")
-                failed += 1
+
+        if args.dry_run:
+            print(f"[DRY RUN] Would execute command {idx}/{total_commands}")
             print("-" * 80)
+            continue
+
+        returncode = run_command_with_live_output(cmd, idx, total_commands)
+        if returncode == 0:
+            print(f"✓ Successfully completed command {idx}/{total_commands}")
+            successful += 1
         else:
-            print(f"[DRY RUN] Would execute command {i}/{len(masks)}")
-            print("-" * 80)
-    
-    # Final summary
+            print(f"✗ Failed command {idx}/{total_commands} (exit code: {returncode})")
+            failed += 1
+        print("-" * 80)
+
     print(f"\n{'='*80}")
-    print(f"Processing complete for image '{image_name}'")
+    print(f"Processing complete for data root '{data_root}'")
     if not args.dry_run:
-        print(f"Total: {len(masks)} | Successful: {successful} | Failed: {failed}")
+        print(f"Total commands: {total_commands} | Successful: {successful} | Failed: {failed}")
     print(f"{'='*80}")
 
 
