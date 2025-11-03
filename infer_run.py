@@ -109,6 +109,26 @@ def parse_mask_id_range(range_str):
     return (start, end)
 
 
+def split_tasks_evenly(tasks, num_batches):
+    """
+    Split task list into num_batches chunks with sizes differing by at most 1.
+    """
+    if num_batches < 1:
+        raise ValueError("num_batches must be at least 1.")
+
+    total = len(tasks)
+    base = total // num_batches
+    remainder = total % num_batches
+    batches = []
+    start = 0
+    for batch_idx in range(num_batches):
+        extra = 1 if batch_idx < remainder else 0
+        end = start + base + extra
+        batches.append(tasks[start:end])
+        start = end
+    return batches
+
+
 def clear_lines(n):
     """Clear n lines above cursor."""
     for _ in range(n):
@@ -321,7 +341,7 @@ def main():
         required=True,
         help="Root directory for generated outputs."
     )
-    parser.add_argument("--stride", type=int, default=4, help="Stride parameter.")
+    parser.add_argument("--stride", type=int, default=1, help="Stride parameter.")
     parser.add_argument(
         "--size",
         type=str,
@@ -333,6 +353,18 @@ def main():
         "--mask_id_range",
         type=parse_mask_id_range,
         help="Limit masks by id using 'start-end', 'start-', '-end', or a single id (inclusive)."
+    )
+    parser.add_argument(
+        "--num_batches",
+        type=int,
+        default=1,
+        help="Split the task list into this many batches (evenly as possible)."
+    )
+    parser.add_argument(
+        "--batch_index",
+        type=int,
+        default=0,
+        help="Zero-based index of the batch to run when using --num_batches."
     )
 
     args = parser.parse_args()
@@ -357,6 +389,13 @@ def main():
 
     lora_folder = Path(args.lora_folder).expanduser().resolve() if args.lora_folder else None
 
+    if args.num_batches < 1:
+        print("--num_batches must be at least 1.")
+        return
+    if args.batch_index < 0 or args.batch_index >= args.num_batches:
+        print("--batch_index must be between 0 and num_batches-1.")
+        return
+
     if args.mask_id_range:
         start, end = args.mask_id_range
         start_str = f"{start:03d}" if start is not None else "min"
@@ -371,6 +410,20 @@ def main():
         print("No inference tasks discovered. Nothing to run.")
         return
 
+    total_tasks = len(tasks)
+    total_images = sorted({task["image_name"] for task in tasks})
+
+    if args.num_batches > 1:
+        batches = split_tasks_evenly(tasks, args.num_batches)
+        tasks = batches[args.batch_index]
+        if not tasks:
+            print(f"Batch {args.batch_index + 1}/{args.num_batches} contains no tasks. Nothing to run.")
+            return
+        print(
+            f"Using batch {args.batch_index + 1}/{args.num_batches}: "
+            f"{len(tasks)} task(s) selected out of {total_tasks}."
+        )
+
     image_names = []
     last_name = None
     for task in tasks:
@@ -378,7 +431,12 @@ def main():
             image_names.append(task["image_name"])
             last_name = task["image_name"]
 
-    print(f"Discovered {len(image_names)} image(s) with {len(tasks)} mask(s) in {annotations_root}.")
+    print(f"Discovered {len(total_images)} image(s) with {total_tasks} mask(s) in {annotations_root}.")
+    if args.num_batches > 1:
+        print(f"Running subset covering {len(image_names)} image(s) with {len(tasks)} mask(s).")
+    else:
+        print(f"Running {len(image_names)} image(s) with {len(tasks)} mask(s).")
+
     for image_name in image_names:
         mask_ids = [task["mask_id"] for task in tasks if task["image_name"] == image_name]
         mask_ids_str = ", ".join(f"{mask_id:03d}" for mask_id in mask_ids)
