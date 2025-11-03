@@ -38,7 +38,7 @@ def parse_mask_filename(mask_filename, image_name, fallback_hash=None):
 
 
 def generate_command(img_path, lora_folder, prompt, output_root, mask_path,
-                     hash_part, mask_id, stride, size="512,512"):
+                     hash_part, mask_id, stride, size="512,512", checkpoint_step=None):
     """Generate inference command for a single mask."""
     image_name = extract_image_name(img_path)
     output_path = os.path.join(
@@ -59,6 +59,8 @@ def generate_command(img_path, lora_folder, prompt, output_root, mask_path,
         "--mask_path", mask_path,
         "--stride", str(stride),
     ])
+    if checkpoint_step is not None:
+        cmd.extend(["--checkpoint_step", str(checkpoint_step)])
 
     return cmd
 
@@ -348,6 +350,12 @@ def main():
         default="512,512",
         help="Output size (width,height). Use blank string to keep original size."
     )
+    parser.add_argument(
+        "--checkpoint_step",
+        type=int,
+        default=None,
+        help="Only run the LoRA checkpoint whose filename contains this step number."
+    )
     parser.add_argument("--dry_run", action="store_true", help="Print commands without executing.")
     parser.add_argument(
         "--mask_id_range",
@@ -389,6 +397,10 @@ def main():
 
     lora_folder = Path(args.lora_folder).expanduser().resolve() if args.lora_folder else None
 
+    if args.checkpoint_step is not None and lora_folder is None:
+        print("--checkpoint_step requires --lora_folder to be set.")
+        return
+
     if args.num_batches < 1:
         print("--num_batches must be at least 1.")
         return
@@ -401,6 +413,9 @@ def main():
         start_str = f"{start:03d}" if start is not None else "min"
         end_str = f"{end:03d}" if end is not None else "max"
         print(f"Mask id filter applied: {start_str} to {end_str}")
+
+    if args.checkpoint_step is not None:
+        print(f"Checkpoint step filter applied: {args.checkpoint_step}")
 
     tasks, warnings = collect_dataset_tasks(data_root, annotations_root, args.mask_id_range)
     for warning in warnings:
@@ -459,7 +474,8 @@ def main():
             task["hash_part"],
             task["mask_id"],
             args.stride,
-            size_arg
+            size_arg,
+            args.checkpoint_step
         )
 
         print(f"Command {idx}/{total_commands} for {task['image_name']} mask {task['mask_id']:03d}:")

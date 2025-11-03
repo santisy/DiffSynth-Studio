@@ -17,6 +17,12 @@ parser.add_argument("--output_path", type=str, required=True)
 parser.add_argument("--size", type=lambda y: [int(x) for x in y.split(',')], default=None)
 parser.add_argument("--step_threshold", type=int, default=None)
 parser.add_argument("--stride", type=int, default=1, help="Stride length to filter checkpoints (e.g., stride=5 means every 5th checkpoint)")
+parser.add_argument(
+    "--checkpoint_step",
+    type=int,
+    default=None,
+    help="Only run the LoRA checkpoint whose filename contains this step number."
+)
 
 args = parser.parse_args()
 
@@ -25,8 +31,13 @@ os.makedirs(args.output_path, exist_ok=True)
 step_threshold = args.step_threshold
 stride = args.stride
 lora_folder = args.lora_folder
+checkpoint_step = args.checkpoint_step
 lora_ckpts = []
 step_n_list = []
+
+if checkpoint_step is not None and lora_folder is None:
+    print("--checkpoint_step requires --lora_folder to be set.")
+    raise SystemExit(1)
 
 if lora_folder is not None:
     # Get all LoRA checkpoints
@@ -45,17 +56,25 @@ if lora_folder is not None:
     # Sort by step number
     checkpoint_pairs.sort(key=lambda x: x[0])
     
-    # Apply stride filtering and step threshold
+    # Apply step threshold, optional checkpoint filter, then stride
     filtered_pairs = []
-    for i, (step_num, ckpt, basename) in enumerate(checkpoint_pairs):
-        # Apply step threshold filter
+    for step_num, ckpt, basename in checkpoint_pairs:
         if step_threshold is not None and step_num < step_threshold:
             continue
-        
-        # Apply stride filter (take every stride-th checkpoint)
-        if i % stride == 0:
-            filtered_pairs.append((step_num, ckpt, basename))
-    
+        if checkpoint_step is not None and step_num != checkpoint_step:
+            continue
+        filtered_pairs.append((step_num, ckpt, basename))
+
+    if checkpoint_step is not None and not filtered_pairs:
+        print(f"Checkpoint step {checkpoint_step} not found in {lora_folder}.")
+        raise SystemExit(1)
+
+    stride_filtered = []
+    for idx, (step_num, ckpt, basename) in enumerate(filtered_pairs):
+        if idx % stride == 0:
+            stride_filtered.append((step_num, ckpt, basename))
+    filtered_pairs = stride_filtered
+
     # Skip checkpoints whose outputs already exist
     for _, ckpt, basename in filtered_pairs:
         out_file = os.path.join(args.output_path, f"{basename}.mp4")
@@ -66,13 +85,16 @@ if lora_folder is not None:
         step_n_list.append(basename)
 
 
+include_original = checkpoint_step is None
+
 # Always include the original checkpoint (no LoRA) if not already rendered
-original_out = os.path.join(args.output_path, "original_ckpt.mp4")
-if not os.path.exists(original_out):
-    lora_ckpts.append(None)
-    step_n_list.append('original_ckpt')
-else:
-    print(f"Skipping original checkpoint because '{original_out}' already exists.")
+if include_original:
+    original_out = os.path.join(args.output_path, "original_ckpt.mp4")
+    if not os.path.exists(original_out):
+        lora_ckpts.append(None)
+        step_n_list.append('original_ckpt')
+    else:
+        print(f"Skipping original checkpoint because '{original_out}' already exists.")
 
 if not lora_ckpts:
     print("No checkpoints to process; all outputs already exist.")
@@ -93,7 +115,10 @@ else:
     height = 480
     resize = image.size
 
-print(f"Processing {len(lora_ckpts)} checkpoints (including original)...")
+if include_original:
+    print(f"Processing {len(lora_ckpts)} checkpoints (including original)...")
+else:
+    print(f"Processing {len(lora_ckpts)} checkpoint(s)...")
 if lora_folder is not None:
     print(f"LoRA checkpoints to process: {[s for s in step_n_list if s != 'original_ckpt']}")
 
