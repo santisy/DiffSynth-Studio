@@ -38,7 +38,7 @@ def parse_mask_filename(mask_filename, image_name, fallback_hash=None):
 
 
 def generate_command(img_path, lora_folder, prompt, output_root, mask_path,
-                     hash_part, mask_id, stride, size="512,512", checkpoint_step=None):
+                     hash_part, mask_id, stride, size="512,512", crop_mode="mask-square", checkpoint_step=None):
     """Generate inference command for a single mask."""
     image_name = extract_image_name(img_path)
     output_path = os.path.join(
@@ -55,6 +55,8 @@ def generate_command(img_path, lora_folder, prompt, output_root, mask_path,
     ])
     if size:
         cmd.extend(["--size", size])
+    if crop_mode:
+        cmd.extend(["--crop_mode", crop_mode])
     cmd.extend([
         "--mask_path", mask_path,
         "--stride", str(stride),
@@ -351,6 +353,13 @@ def main():
         help="Output size (width,height). Use blank string to keep original size."
     )
     parser.add_argument(
+        "--crop_mode",
+        type=str,
+        default="mask-square",
+        choices=["mask-square", "full-resize"],
+        help="mask-square crops around the mask; full-resize preserves legacy full-frame resizing."
+    )
+    parser.add_argument(
         "--checkpoint_step",
         type=int,
         default=None,
@@ -475,6 +484,7 @@ def main():
             task["mask_id"],
             args.stride,
             size_arg,
+            args.crop_mode,
             args.checkpoint_step
         )
 
