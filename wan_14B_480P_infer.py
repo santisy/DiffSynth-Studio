@@ -115,23 +115,24 @@ original_image = Image.open(args.img_path).convert("RGB")
 original_mask = Image.open(args.mask_path).convert("L")
 original_size = original_image.size
 img_w, img_h = original_size
-resize = None
+output_resize = None
 crop_metadata = None
 
 if args.crop_mode == "full-resize":
     image = original_image
     mask = original_mask
+    output_resize = original_size  # Always stretch back to source canvas for legacy behavior.
     if args.size is not None:
         if len(args.size) != 2:
             raise ValueError("--size must include width and height, e.g., 512,512")
         width, height = args.size[0], args.size[1]
-        resize = (width, height)
-        image = image.resize(resize, resample=Image.Resampling.BILINEAR)
-        mask = mask.resize(resize, resample=Image.Resampling.NEAREST)
+        inference_size = (width, height)
+        image = image.resize(inference_size, resample=Image.Resampling.BILINEAR)
+        mask = mask.resize(inference_size, resample=Image.Resampling.NEAREST)
     else:
         width = 832
         height = 480
-        resize = original_size
+        inference_size = (width, height)
     print("Full-resize mode: using entire image without mask-driven cropping.")
 else:
     mask_array = np.array(original_mask)
@@ -275,7 +276,7 @@ for i, (lora_ckpt, step_n) in enumerate(zip(lora_ckpts, step_n_list)):
 
         save_video(composited_frames, out_path, fps=15, quality=5)
     else:
-        save_video(video, out_path, fps=15, quality=5, resize=resize)
+        save_video(video, out_path, fps=15, quality=5, resize=output_resize)
     
     print(f"Saved video: {out_path}")
     
