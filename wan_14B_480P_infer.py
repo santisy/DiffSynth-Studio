@@ -1,8 +1,10 @@
 import argparse
 import glob
 import gc
+import math
 import os
 import re
+import numpy as np
 from PIL import Image
 import torch
 from diffsynth import save_video
@@ -15,6 +17,13 @@ parser.add_argument("--mask_path", type=str, required=True)
 parser.add_argument("--prompt", type=str, required=True)
 parser.add_argument("--output_path", type=str, required=True)
 parser.add_argument("--size", type=lambda y: [int(x) for x in y.split(',')], default=None)
+parser.add_argument(
+    "--crop_mode",
+    type=str,
+    default="mask-square",
+    choices=["mask-square", "full-resize"],
+    help="mask-square: crop square around mask; full-resize: resize entire image as before."
+)
 parser.add_argument("--step_threshold", type=int, default=None)
 parser.add_argument("--stride", type=int, default=1, help="Stride length to filter checkpoints (e.g., stride=5 means every 5th checkpoint)")
 parser.add_argument(
@@ -102,18 +111,100 @@ if not lora_ckpts:
 
 MODEL_ROOT = "/mnt/shared-storage-user/yangdingdong/models/Wan2.1-I2V-14B-480P"
 
-image = Image.open(args.img_path).convert("RGB")
-mask = Image.open(args.mask_path)
-if args.size is not None:
-    resize = image.size
-    image = image.resize((args.size[0], args.size[1]), resample=Image.Resampling.BILINEAR)
-    mask = mask.resize((args.size[0], args.size[1]), resample=Image.Resampling.BILINEAR)
-    width = args.size[0]
-    height = args.size[1]
+original_image = Image.open(args.img_path).convert("RGB")
+original_mask = Image.open(args.mask_path).convert("L")
+original_size = original_image.size
+img_w, img_h = original_size
+resize = None
+crop_metadata = None
+
+if args.crop_mode == "full-resize":
+    image = original_image
+    mask = original_mask
+    if args.size is not None:
+        if len(args.size) != 2:
+            raise ValueError("--size must include width and height, e.g., 512,512")
+        width, height = args.size[0], args.size[1]
+        resize = (width, height)
+        image = image.resize(resize, resample=Image.Resampling.BILINEAR)
+        mask = mask.resize(resize, resample=Image.Resampling.NEAREST)
+    else:
+        width = 832
+        height = 480
+        resize = original_size
+    print("Full-resize mode: using entire image without mask-driven cropping.")
 else:
-    width = 832
-    height = 480
-    resize = image.size
+    mask_array = np.array(original_mask)
+    mask_binary = mask_array > 0
+    min_square_limit = min(img_w, img_h)
+
+    if mask_binary.any():
+        y_indices, x_indices = np.where(mask_binary)
+        x_min, x_max = int(x_indices.min()), int(x_indices.max())
+        y_min, y_max = int(y_indices.min()), int(y_indices.max())
+        center_x = (x_min + x_max + 1) / 2.0
+        center_y = (y_min + y_max + 1) / 2.0
+
+        bbox_w = x_max - x_min + 1
+        bbox_h = y_max - y_min + 1
+        required_side = max(bbox_w, bbox_h)
+        square_side = min_square_limit
+        if required_side > square_side:
+            print("Warning: mask bounding box is larger than the largest possible square crop; some content may be truncated.")
+
+        allowed_left_min = max(0, x_max + 1 - square_side)
+        allowed_left_max = min(img_w - square_side, x_min)
+        allowed_top_min = max(0, y_max + 1 - square_side)
+        allowed_top_max = min(img_h - square_side, y_min)
+
+        if allowed_left_min > allowed_left_max:
+            allowed_left_min = allowed_left_max = max(0, min(img_w - square_side, x_min))
+        if allowed_top_min > allowed_top_max:
+            allowed_top_min = allowed_top_max = max(0, min(img_h - square_side, y_min))
+
+        left_float = center_x - square_side / 2.0
+        top_float = center_y - square_side / 2.0
+        left = int(round(left_float))
+        top = int(round(top_float))
+        left = max(allowed_left_min, min(left, allowed_left_max))
+        top = max(allowed_top_min, min(top, allowed_top_max))
+    else:
+        print("Warning: mask has no active pixels; using centered crop.")
+        square_side = min_square_limit
+        left = (img_w - square_side) // 2
+        top = (img_h - square_side) // 2
+
+    right = left + square_side
+    bottom = top + square_side
+    crop_box = (left, top, right, bottom)
+
+    cropped_image = original_image.crop(crop_box)
+    cropped_mask_array = (np.array(original_mask.crop(crop_box)) > 0).astype(np.uint8) * 255
+    cropped_mask = Image.fromarray(cropped_mask_array, mode="L")
+
+    if args.size is not None:
+        if len(args.size) != 2:
+            raise ValueError("--size must include width and height, e.g., 512,512")
+        requested_side = min(args.size[0], args.size[1])
+        if args.size[0] != args.size[1]:
+            print(f"Provided --size {args.size} is not square; using {requested_side} to preserve aspect ratio.")
+    else:
+        requested_side = square_side
+
+    target_side = max(16, int(math.ceil(requested_side / 16.0) * 16))
+
+    image = cropped_image.resize((target_side, target_side), resample=Image.Resampling.LANCZOS)
+    mask = cropped_mask.resize((target_side, target_side), resample=Image.Resampling.NEAREST)
+
+    width = target_side
+    height = target_side
+    crop_metadata = {
+        "crop_box": crop_box,
+        "crop_size": square_side,
+        "paste_offset": (left, top)
+    }
+
+    print(f"Cropping square region {crop_box} -> pipeline input {target_side}x{target_side}")
 
 if include_original:
     print(f"Processing {len(lora_ckpts)} checkpoints (including original)...")
@@ -161,7 +252,30 @@ for i, (lora_ckpt, step_n) in enumerate(zip(lora_ckpts, step_n_list)):
     )
     
     out_path = os.path.join(args.output_path, f"{step_n}.mp4")
-    save_video(video, out_path, fps=15, quality=5, resize=resize)
+    if crop_metadata is not None:
+        composited_frames = []
+        crop_size = crop_metadata["crop_size"]
+        paste_offset = crop_metadata["paste_offset"]
+
+        for frame in video:
+            if isinstance(frame, Image.Image):
+                pil_frame = frame.convert("RGB")
+            elif isinstance(frame, torch.Tensor):
+                frame_np = frame.detach().cpu().permute(1, 2, 0).numpy()
+                pil_frame = Image.fromarray(((frame_np.clip(0, 1)) * 255).astype(np.uint8)).convert("RGB")
+            else:
+                pil_frame = Image.fromarray(np.array(frame)).convert("RGB")
+
+            if pil_frame.size != (crop_size, crop_size):
+                pil_frame = pil_frame.resize((crop_size, crop_size), resample=Image.Resampling.LANCZOS)
+
+            canvas = original_image.copy()
+            canvas.paste(pil_frame, paste_offset)
+            composited_frames.append(canvas)
+
+        save_video(composited_frames, out_path, fps=15, quality=5)
+    else:
+        save_video(video, out_path, fps=15, quality=5, resize=resize)
     
     print(f"Saved video: {out_path}")
     
