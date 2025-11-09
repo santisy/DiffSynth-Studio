@@ -13,7 +13,7 @@ from diffsynth.pipelines.wan_video_new import WanVideoPipeline, ModelConfig
 parser = argparse.ArgumentParser()
 parser.add_argument("--lora_folder", type=str, default=None)
 parser.add_argument("--img_path", type=str, required=True)
-parser.add_argument("--mask_path", type=str, required=True)
+parser.add_argument("--mask_path", type=str, default=None)
 parser.add_argument("--prompt", type=str, required=True)
 parser.add_argument("--output_path", type=str, required=True)
 parser.add_argument("--size", type=lambda y: [int(x) for x in y.split(',')], default=None)
@@ -32,8 +32,49 @@ parser.add_argument(
     default=None,
     help="Only run the LoRA checkpoint whose filename contains this step number."
 )
+parser.add_argument(
+    "--baseline",
+    action="store_true",
+    help="Run the base WAN 14B 480P model without LoRA, mask guidance, or cropping."
+)
 
 args = parser.parse_args()
+
+baseline_mode = args.baseline
+
+if baseline_mode:
+    if args.crop_mode != "full-resize":
+        print("Baseline mode: forcing --crop_mode full-resize.")
+    args.crop_mode = "full-resize"
+
+    if args.size != [832, 480]:
+        if args.size is not None:
+            print("Baseline mode: overriding --size to 832,480.")
+    args.size = [832, 480]
+
+    if args.mask_path is not None:
+        print("Baseline mode: ignoring provided --mask_path.")
+    args.mask_path = None
+
+    if args.lora_folder is not None:
+        print("Baseline mode: ignoring --lora_folder.")
+    args.lora_folder = None
+
+    if args.checkpoint_step is not None:
+        print("Baseline mode: ignoring --checkpoint_step.")
+    args.checkpoint_step = None
+
+    if args.step_threshold is not None:
+        print("Baseline mode: ignoring --step_threshold.")
+    args.step_threshold = None
+
+    if args.stride != 1:
+        print("Baseline mode: forcing --stride to 1.")
+    args.stride = 1
+
+if args.mask_path is None and not baseline_mode:
+    print("--mask_path is required unless --baseline is specified.")
+    raise SystemExit(1)
 
 os.makedirs(args.output_path, exist_ok=True)
 
@@ -112,7 +153,9 @@ if not lora_ckpts:
 MODEL_ROOT = "/mnt/shared-storage-user/yangdingdong/models/Wan2.1-I2V-14B-480P"
 
 original_image = Image.open(args.img_path).convert("RGB")
-original_mask = Image.open(args.mask_path).convert("L")
+original_mask = None
+if args.mask_path is not None:
+    original_mask = Image.open(args.mask_path).convert("L")
 original_size = original_image.size
 img_w, img_h = original_size
 output_resize = None
@@ -120,7 +163,7 @@ crop_metadata = None
 
 if args.crop_mode == "full-resize":
     image = original_image
-    mask = original_mask
+    mask = None if baseline_mode else original_mask
     output_resize = original_size  # Always stretch back to source canvas for legacy behavior.
     if args.size is not None:
         if len(args.size) != 2:
@@ -128,13 +171,18 @@ if args.crop_mode == "full-resize":
         width, height = args.size[0], args.size[1]
         inference_size = (width, height)
         image = image.resize(inference_size, resample=Image.Resampling.BILINEAR)
-        mask = mask.resize(inference_size, resample=Image.Resampling.NEAREST)
+        if mask is not None:
+            mask = mask.resize(inference_size, resample=Image.Resampling.NEAREST)
     else:
         width = 832
         height = 480
         inference_size = (width, height)
+        if mask is not None:
+            mask = mask.resize(inference_size, resample=Image.Resampling.NEAREST)
     print("Full-resize mode: using entire image without mask-driven cropping.")
 else:
+    if original_mask is None:
+        raise ValueError("mask-square mode requires --mask_path.")
     mask_array = np.array(original_mask)
     mask_binary = mask_array > 0
     min_square_limit = min(img_w, img_h)

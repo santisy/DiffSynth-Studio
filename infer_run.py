@@ -9,6 +9,11 @@ from collections import deque
 import re
 
 
+def normalize_reference(value):
+    """Return a lowercase POSIX-style representation for comparison."""
+    return Path(value).as_posix().lower()
+
+
 def extract_image_name(img_path):
     """Extract image name without extension from path."""
     return Path(img_path).stem
@@ -38,7 +43,8 @@ def parse_mask_filename(mask_filename, image_name, fallback_hash=None):
 
 
 def generate_command(img_path, lora_folder, prompt, output_root, mask_path,
-                     hash_part, mask_id, stride, size="512,512", crop_mode="mask-square", checkpoint_step=None):
+                     hash_part, mask_id, stride, size="512,512", crop_mode="mask-square",
+                     checkpoint_step=None, baseline=False):
     """Generate inference command for a single mask."""
     image_name = extract_image_name(img_path)
     output_path = os.path.join(
@@ -46,8 +52,10 @@ def generate_command(img_path, lora_folder, prompt, output_root, mask_path,
     )
 
     cmd = ["python", "wan_14B_480P_infer.py"]
+    if baseline:
+        cmd.append("--baseline")
     cmd.extend(["--img_path", img_path])
-    if lora_folder:
+    if lora_folder and not baseline:
         cmd.extend(["--lora_folder", lora_folder])
     cmd.extend([
         "--prompt", prompt,
@@ -57,10 +65,11 @@ def generate_command(img_path, lora_folder, prompt, output_root, mask_path,
         cmd.extend(["--size", size])
     if crop_mode:
         cmd.extend(["--crop_mode", crop_mode])
-    cmd.extend([
-        "--mask_path", mask_path,
-        "--stride", str(stride),
-    ])
+    if not baseline:
+        if not mask_path:
+            raise ValueError("mask_path is required unless baseline mode is enabled.")
+        cmd.extend(["--mask_path", mask_path])
+    cmd.extend(["--stride", str(stride)])
     if checkpoint_step is not None:
         cmd.extend(["--checkpoint_step", str(checkpoint_step)])
 
@@ -236,12 +245,18 @@ def run_command_with_live_output(cmd, command_num, total_commands):
     return returncode
 
 
-def collect_dataset_tasks(data_root, annotations_root, mask_id_range=None):
+def collect_dataset_tasks(
+    data_root,
+    annotations_root,
+    mask_id_range=None,
+    annotation_filenames=None,
+    image_filenames=None
+):
     """
     Collect all inference tasks from dataset root.
     Returns a tuple (tasks, warnings).
     Each task is a dict with keys:
-        image_name, image_path, mask_path, mask_id, hash_part, prompt
+        image_name, image_filename, image_path, mask_path, mask_id, hash_part, prompt
     """
     data_root = Path(data_root)
     annotations_root = Path(annotations_root)
@@ -249,7 +264,42 @@ def collect_dataset_tasks(data_root, annotations_root, mask_id_range=None):
     tasks = []
     warnings = []
 
-    json_paths = sorted(annotations_root.glob("*.json"))
+    if annotation_filenames:
+        seen_paths = set()
+        json_paths = []
+        for entry in annotation_filenames:
+            raw_path = Path(entry)
+            candidates = []
+            if raw_path.is_absolute():
+                candidates.append(raw_path)
+                if raw_path.suffix.lower() != ".json":
+                    candidates.append(raw_path.with_suffix(".json"))
+            else:
+                candidate = annotations_root / raw_path
+                candidates.append(candidate)
+                if raw_path.suffix.lower() != ".json":
+                    candidates.append(candidate.with_suffix(".json"))
+
+            resolved = None
+            for candidate in candidates:
+                if candidate.is_file():
+                    resolved = candidate.resolve()
+                    break
+            if resolved is None:
+                warnings.append(f"Annotation file not found for '{entry}'.")
+                continue
+            if resolved not in seen_paths:
+                json_paths.append(resolved)
+                seen_paths.add(resolved)
+    else:
+        json_paths = sorted(annotations_root.glob("*.json"))
+
+    image_filename_filters = None
+    image_basename_filters = None
+    if image_filenames:
+        image_filename_filters = {normalize_reference(name) for name in image_filenames}
+        image_basename_filters = {Path(name).name.lower() for name in image_filenames}
+
     for json_path in json_paths:
         try:
             with open(json_path, "r", encoding="utf-8") as handle:
@@ -262,6 +312,15 @@ def collect_dataset_tasks(data_root, annotations_root, mask_id_range=None):
         if not image_filename:
             warnings.append(f"{json_path} missing 'image_filename'; skipping.")
             continue
+        normalized_image_filename = normalize_reference(image_filename)
+        image_basename = Path(image_filename).name.lower()
+
+        if image_filename_filters:
+            if (
+                normalized_image_filename not in image_filename_filters
+                and image_basename not in image_basename_filters
+            ):
+                continue
 
         image_path = data_root / image_filename
         if not image_path.is_file():
@@ -306,6 +365,8 @@ def collect_dataset_tasks(data_root, annotations_root, mask_id_range=None):
 
             tasks.append({
                 "image_name": image_name,
+                "image_filename": image_filename,
+                "annotation_path": str(json_path),
                 "image_path": str(image_path.resolve()),
                 "mask_path": str(mask_path.resolve()),
                 "mask_id": mask_id,
@@ -383,8 +444,43 @@ def main():
         default=0,
         help="Zero-based index of the batch to run when using --num_batches."
     )
+    parser.add_argument(
+        "--annotation_files",
+        type=str,
+        nargs="+",
+        help="Annotation JSON filename(s) to process (relative to the annotations directory)."
+    )
+    parser.add_argument(
+        "--image_filenames",
+        type=str,
+        nargs="+",
+        help="Image filename(s) to process. Matches against entries in annotations."
+    )
+    parser.add_argument(
+        "--baseline",
+        action="store_true",
+        help="Run baseline 480p inference without LoRA or mask guidance."
+    )
 
     args = parser.parse_args()
+
+    if args.baseline:
+        if args.lora_folder:
+            print("Baseline mode: ignoring --lora_folder.")
+        args.lora_folder = None
+
+        if args.checkpoint_step is not None:
+            print("Baseline mode: ignoring --checkpoint_step.")
+        args.checkpoint_step = None
+
+        if args.crop_mode != "full-resize":
+            print("Baseline mode: forcing --crop_mode full-resize.")
+        args.crop_mode = "full-resize"
+
+        if args.size != "832,480":
+            if args.size:
+                print("Baseline mode: overriding --size to 832,480.")
+        args.size = "832,480"
 
     data_root = Path(args.data_root).expanduser().resolve()
 
@@ -426,7 +522,35 @@ def main():
     if args.checkpoint_step is not None:
         print(f"Checkpoint step filter applied: {args.checkpoint_step}")
 
-    tasks, warnings = collect_dataset_tasks(data_root, annotations_root, args.mask_id_range)
+    if args.annotation_files:
+        print("Annotation filter applied: " + ", ".join(args.annotation_files))
+    if args.image_filenames:
+        print("Image filename filter applied: " + ", ".join(args.image_filenames))
+
+    tasks, warnings = collect_dataset_tasks(
+        data_root,
+        annotations_root,
+        args.mask_id_range,
+        args.annotation_files,
+        args.image_filenames,
+    )
+    if args.image_filenames:
+        matched_full = {
+            normalize_reference(task["image_filename"])
+            for task in tasks
+            if task.get("image_filename")
+        }
+        matched_base = {
+            Path(task["image_filename"]).name.lower()
+            for task in tasks
+            if task.get("image_filename")
+        }
+        for value in args.image_filenames:
+            norm = normalize_reference(value)
+            base = Path(value).name.lower()
+            if norm not in matched_full and base not in matched_base:
+                warnings.append(f"No annotation entry references image filename '{value}'.")
+
     for warning in warnings:
         print(f"[WARN] {warning}")
 
@@ -474,18 +598,20 @@ def main():
     failed = 0
 
     for idx, task in enumerate(tasks, 1):
+        mask_path = None if args.baseline else task["mask_path"]
         cmd = generate_command(
             task["image_path"],
             str(lora_folder) if lora_folder else None,
             task["prompt"],
             str(output_root),
-            task["mask_path"],
+            mask_path,
             task["hash_part"],
             task["mask_id"],
             args.stride,
             size_arg,
             args.crop_mode,
-            args.checkpoint_step
+            args.checkpoint_step,
+            baseline=args.baseline
         )
 
         print(f"Command {idx}/{total_commands} for {task['image_name']} mask {task['mask_id']:03d}:")
