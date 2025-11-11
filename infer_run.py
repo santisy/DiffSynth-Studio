@@ -122,6 +122,32 @@ def parse_mask_id_range(range_str):
     return (start, end)
 
 
+def parse_checkpoint_steps(value):
+    """
+    Parse comma-separated checkpoint steps into a list of integers.
+    """
+    if value is None:
+        return None
+
+    parts = [part.strip() for part in value.split(",")]
+    if any(part == "" for part in parts):
+        raise argparse.ArgumentTypeError(
+            "Checkpoint steps must be comma-separated integers without empty values."
+        )
+
+    try:
+        steps = [int(part) for part in parts]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "Checkpoint steps must be comma-separated integers."
+        ) from exc
+
+    if not steps:
+        raise argparse.ArgumentTypeError("At least one checkpoint step must be provided.")
+
+    return steps
+
+
 def split_tasks_evenly(tasks, num_batches):
     """
     Split task list into num_batches chunks with sizes differing by at most 1.
@@ -422,9 +448,9 @@ def main():
     )
     parser.add_argument(
         "--checkpoint_step",
-        type=int,
+        type=parse_checkpoint_steps,
         default=None,
-        help="Only run the LoRA checkpoint whose filename contains this step number."
+        help="Comma-separated list of LoRA checkpoint step numbers to run."
     )
     parser.add_argument("--dry_run", action="store_true", help="Print commands without executing.")
     parser.add_argument(
@@ -520,7 +546,8 @@ def main():
         print(f"Mask id filter applied: {start_str} to {end_str}")
 
     if args.checkpoint_step is not None:
-        print(f"Checkpoint step filter applied: {args.checkpoint_step}")
+        steps_str = ", ".join(str(step) for step in args.checkpoint_step)
+        print(f"Checkpoint step filter applied: {steps_str}")
 
     if args.annotation_files:
         print("Annotation filter applied: " + ", ".join(args.annotation_files))
@@ -593,44 +620,52 @@ def main():
     print("\nGenerating commands...\n")
 
     size_arg = args.size if args.size else None
-    total_commands = len(tasks)
+    checkpoint_steps = args.checkpoint_step if args.checkpoint_step is not None else [None]
+    total_commands = len(tasks) * len(checkpoint_steps)
     successful = 0
     failed = 0
 
-    for idx, task in enumerate(tasks, 1):
+    command_idx = 0
+    for task in tasks:
         mask_path = None if args.baseline else task["mask_path"]
-        cmd = generate_command(
-            task["image_path"],
-            str(lora_folder) if lora_folder else None,
-            task["prompt"],
-            str(output_root),
-            mask_path,
-            task["hash_part"],
-            task["mask_id"],
-            args.stride,
-            size_arg,
-            args.crop_mode,
-            args.checkpoint_step,
-            baseline=args.baseline
-        )
+        for checkpoint_step in checkpoint_steps:
+            command_idx += 1
+            cmd = generate_command(
+                task["image_path"],
+                str(lora_folder) if lora_folder else None,
+                task["prompt"],
+                str(output_root),
+                mask_path,
+                task["hash_part"],
+                task["mask_id"],
+                args.stride,
+                size_arg,
+                args.crop_mode,
+                checkpoint_step,
+                baseline=args.baseline
+            )
 
-        print(f"Command {idx}/{total_commands} for {task['image_name']} mask {task['mask_id']:03d}:")
-        print(shlex.join(cmd))
-        print()
+            step_suffix = f" step {checkpoint_step}" if checkpoint_step is not None else ""
+            print(
+                f"Command {command_idx}/{total_commands} for "
+                f"{task['image_name']} mask {task['mask_id']:03d}{step_suffix}:"
+            )
+            print(shlex.join(cmd))
+            print()
 
-        if args.dry_run:
-            print(f"[DRY RUN] Would execute command {idx}/{total_commands}")
+            if args.dry_run:
+                print(f"[DRY RUN] Would execute command {command_idx}/{total_commands}")
+                print("-" * 80)
+                continue
+
+            returncode = run_command_with_live_output(cmd, command_idx, total_commands)
+            if returncode == 0:
+                print(f"✓ Successfully completed command {command_idx}/{total_commands}")
+                successful += 1
+            else:
+                print(f"✗ Failed command {command_idx}/{total_commands} (exit code: {returncode})")
+                failed += 1
             print("-" * 80)
-            continue
-
-        returncode = run_command_with_live_output(cmd, idx, total_commands)
-        if returncode == 0:
-            print(f"✓ Successfully completed command {idx}/{total_commands}")
-            successful += 1
-        else:
-            print(f"✗ Failed command {idx}/{total_commands} (exit code: {returncode})")
-            failed += 1
-        print("-" * 80)
 
     print(f"\n{'='*80}")
     print(f"Processing complete for data root '{data_root}'")
