@@ -4,6 +4,7 @@ import subprocess
 import sys
 import json
 import shlex
+import tempfile
 from pathlib import Path
 from collections import deque
 import re
@@ -42,37 +43,29 @@ def parse_mask_filename(mask_filename, image_name, fallback_hash=None):
     )
 
 
-def generate_command(img_path, lora_folder, prompt, output_root, mask_path,
-                     hash_part, mask_id, stride, size="512,512", crop_mode="mask-square",
-                     checkpoint_step=None, baseline=False):
-    """Generate inference command for a single mask."""
-    image_name = extract_image_name(img_path)
-    output_path = os.path.join(
-        output_root, f"{image_name}-{hash_part}-results_mask_{mask_id:03d}"
-    )
-
-    cmd = ["python", "wan_14B_480P_infer.py"]
+def generate_batch_command(
+    tasks_file,
+    lora_folder,
+    stride,
+    size="512,512",
+    crop_mode="mask-square",
+    checkpoint_step=None,
+    baseline=False,
+):
+    """Generate inference command covering all tasks in a batch."""
+    cmd = ["python", "wan_14B_480P_infer.py", "--tasks_file", tasks_file]
     if baseline:
         cmd.append("--baseline")
-    cmd.extend(["--img_path", img_path])
     if lora_folder and not baseline:
         cmd.extend(["--lora_folder", lora_folder])
-    cmd.extend([
-        "--prompt", prompt,
-        "--output_path", output_path,
-    ])
     if size:
         cmd.extend(["--size", size])
     if crop_mode:
         cmd.extend(["--crop_mode", crop_mode])
-    if not baseline:
-        if not mask_path:
-            raise ValueError("mask_path is required unless baseline mode is enabled.")
-        cmd.extend(["--mask_path", mask_path])
-    cmd.extend(["--stride", str(stride)])
+    if stride:
+        cmd.extend(["--stride", str(stride)])
     if checkpoint_step is not None:
         cmd.extend(["--checkpoint_step", str(checkpoint_step)])
-
     return cmd
 
 
@@ -617,27 +610,53 @@ def main():
         mask_ids_str = ", ".join(f"{mask_id:03d}" for mask_id in mask_ids)
         print(f"  - {image_name}: masks {mask_ids_str}")
 
-    print("\nGenerating commands...\n")
+    print("\nPreparing batch commands...\n")
 
     size_arg = args.size if args.size else None
+
+    batch_tasks = []
+    for task in tasks:
+        mask_path = None if args.baseline else task["mask_path"]
+        output_path = os.path.join(
+            str(output_root),
+            f"{task['image_name']}-{task['hash_part']}-results_mask_{task['mask_id']:03d}"
+        )
+        batch_tasks.append({
+            "image_path": task["image_path"],
+            "mask_path": mask_path,
+            "prompt": task["prompt"],
+            "output_path": output_path,
+            "image_name": task["image_name"],
+            "mask_id": task["mask_id"],
+            "hash_part": task["hash_part"],
+            "annotation_path": task.get("annotation_path"),
+        })
+
+    tasks_file_path = None
+    try:
+        temp_handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, dir=str(output_root)
+        )
+        try:
+            json.dump({"tasks": batch_tasks}, temp_handle, ensure_ascii=False, indent=2)
+            temp_handle.flush()
+            tasks_file_path = temp_handle.name
+        finally:
+            temp_handle.close()
+    except OSError as exc:
+        print(f"Failed to write tasks file: {exc}")
+        return
+
     checkpoint_steps = args.checkpoint_step if args.checkpoint_step is not None else [None]
-    total_commands = len(tasks) * len(checkpoint_steps)
+    total_commands = len(checkpoint_steps)
     successful = 0
     failed = 0
 
-    command_idx = 0
-    for task in tasks:
-        mask_path = None if args.baseline else task["mask_path"]
-        for checkpoint_step in checkpoint_steps:
-            command_idx += 1
-            cmd = generate_command(
-                task["image_path"],
+    try:
+        for idx, checkpoint_step in enumerate(checkpoint_steps, start=1):
+            cmd = generate_batch_command(
+                tasks_file_path,
                 str(lora_folder) if lora_folder else None,
-                task["prompt"],
-                str(output_root),
-                mask_path,
-                task["hash_part"],
-                task["mask_id"],
                 args.stride,
                 size_arg,
                 args.crop_mode,
@@ -645,27 +664,29 @@ def main():
                 baseline=args.baseline
             )
 
-            step_suffix = f" step {checkpoint_step}" if checkpoint_step is not None else ""
-            print(
-                f"Command {command_idx}/{total_commands} for "
-                f"{task['image_name']} mask {task['mask_id']:03d}{step_suffix}:"
-            )
+            if checkpoint_step is None:
+                print(f"Command {idx}/{total_commands} covering all available checkpoints:")
+            else:
+                print(f"Command {idx}/{total_commands} for checkpoint step {checkpoint_step}:")
             print(shlex.join(cmd))
             print()
 
             if args.dry_run:
-                print(f"[DRY RUN] Would execute command {command_idx}/{total_commands}")
+                print(f"[DRY RUN] Would execute command {idx}/{total_commands}")
                 print("-" * 80)
                 continue
 
-            returncode = run_command_with_live_output(cmd, command_idx, total_commands)
+            returncode = run_command_with_live_output(cmd, idx, total_commands)
             if returncode == 0:
-                print(f"✓ Successfully completed command {command_idx}/{total_commands}")
+                print(f"✓ Successfully completed command {idx}/{total_commands}")
                 successful += 1
             else:
-                print(f"✗ Failed command {command_idx}/{total_commands} (exit code: {returncode})")
+                print(f"✗ Failed command {idx}/{total_commands} (exit code: {returncode})")
                 failed += 1
             print("-" * 80)
+    finally:
+        if tasks_file_path and os.path.exists(tasks_file_path):
+            os.remove(tasks_file_path)
 
     print(f"\n{'='*80}")
     print(f"Processing complete for data root '{data_root}'")
